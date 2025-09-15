@@ -1,2 +1,5 @@
 # Tailscale-Personal-PowerShell
-Tailscale Personal use PS command
+Check all client in Tailscale Network for Direct and Relay Connection.
+```
+irm https://raw.githubusercontent.com/Alyciazsa/Tailscale-Personal-PowerShell/refs/heads/main/DR-Test.ps1 | iex
+```
