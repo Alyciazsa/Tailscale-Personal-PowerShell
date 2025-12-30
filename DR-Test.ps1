@@ -40,28 +40,27 @@ $results = $sorted | ForEach-Object -Parallel {
     $name = if ($p.Name) { $p.Name } elseif ($p.DNSName) { ($p.DNSName -split '\.')[0] } else { $p.HostName }
     $ip   = $p.IPv4
 
-    # Run a multi-ping to let Tailscale negotiate the best path
-    # We don't use --until-direct here because it can give false positives on Peer-Relays
-    $tp = tailscale ping -c 3 $ip 2>&1 | Out-String
+    # Execute tailscale ping
+    $tp = tailscale ping -c 2 $ip 2>&1 | Out-String
 
-    # Path Detection Logic
+    # Improved Path Detection Logic
     $isDirect = $false
     $isPeerRelay = $false
-    $endpoint = "-"
+    $endpoint = "Unknown"
 
-    if ($tp -match '(?i)direct\s+([0-9.]+:\d+)') {
+    if ($tp -match 'via\s+([0-9.]+:\d+)') {
         $isDirect = $true
         $endpoint = $Matches[1]
-    } elseif ($tp -match '(?i)via\s+peer-relay\s+([0-9.]+:\d+)') {
+    } elseif ($tp -match 'peer-relay\s+([0-9.]+:\d*)') {
         $isPeerRelay = $true
-        $endpoint = "Peer-Relay: " + $Matches[1]
-    } elseif ($tp -match '(?i)DERP\(([^)]+)\)') {
+        $endpoint = "Peer-Relay (" + $Matches[1] + ")"
+    } elseif ($tp -match 'DERP\(([^)]+)\)') {
         $code = $Matches[1]
         $map  = $using:DerpMap
-        $endpoint = if ($map.ContainsKey($code)) { "DERP: $($map[$code])" } else { "DERP: $($code.ToUpper())" }
+        $endpoint = if ($map.ContainsKey($code)) { $map[$code] } else { $code.ToUpper() }
     }
 
-    # Latency via ICMP (classic ping)
+    # Latency via ICMP
     $lat = "-"
     try {
         $pong = ping -n 1 -w 500 $ip 2>&1 | Out-String
@@ -79,8 +78,8 @@ $results = $sorted | ForEach-Object -Parallel {
     }
 } -ThrottleLimit 16
 
-# --- Print Results with 3-color logic ---
-Write-Host "`nTailscale Network Status (P-Relay Aware)`n" -FontWeight Bold
+# --- Print Results ---
+Write-Host "`nTailscale Network Status (P-Relay Aware)`n"
 $results | Sort-Object Index | ForEach-Object {
     if ($_.Direct) {
         $state = "Direct "
