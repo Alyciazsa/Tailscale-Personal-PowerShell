@@ -1,67 +1,106 @@
-# --- Build DERP Map ---
-$DerpMap = @{}
+# --- 1. Pre-fetch DERP Map ---
+$DerpLookup = @{}
 try {
     $derp = irm https://controlplane.tailscale.com/derpmap/default
-    if ($derp -and $derp.Regions) {
-        $derp.Regions.PSObject.Properties | ForEach-Object { $DerpMap[$_.Value.RegionCode] = $_.Value.RegionName }
+    if ($derp -and $derp.Regions) { 
+        $derp.Regions.PSObject.Properties | ForEach-Object { $DerpLookup[$_.Value.RegionCode] = $_.Value.RegionName } 
     }
 } catch { }
 
-# --- Fetch Online Peers ---
-$statusJson = tailscale status --json | ConvertFrom-Json
-$allPeers = $statusJson.Peer.PSObject.Properties.Value | Where-Object { $_.Online -eq $true -and -not $_.Self }
-
-Write-Host "`nNegotiating Paths (Waiting for Tailscale)..." -ForegroundColor Gray
-
-$results = $allPeers | ForEach-Object -Parallel {
-    $p = $_
-    $ip = ($p.TailscaleIPs | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 1)
-    
-    # Increase timeout and force 2 pings to ensure path negotiation finishes
-    $tp = tailscale ping -c 2 -timeout 3s $ip 2>&1 | Out-String
-
-    # Path Detection Logic - Explicit Regex
-    $isDirect = $false; $isPeerRelay = $false; $endpoint = "Relay"
-
-    if ($tp -match 'peer-relay\s+([0-9.]+:[0-9]+)') {
-        $isPeerRelay = $true
-        $endpoint = $Matches[1]
-    } elseif ($tp -match 'direct\s+([0-9.]+:\d+)') {
-        $isDirect = $true
-        $endpoint = $Matches[1]
-    } elseif ($tp -match 'via\s+DERP\(([^)]+)\)') {
-        $code = $Matches[1]; $map = $using:DerpMap
-        $endpoint = if ($map.ContainsKey($code)) { $map[$code] } else { $code.ToUpper() }
-    } elseif ($tp -match 'via\s+([0-9.]+:\d+)') {
-        $isDirect = $true
-        $endpoint = $Matches[1]
-    }
-
-    # ICMP Latency
-    $lat = "-"; $pong = ping -n 1 -w 500 $ip 2>&1 | Out-String
-    if ($pong -match 'time[=<]?\s*(\d+)\s*ms') { $lat = ("{0}ms" -f $Matches[1]) }
-
-    [pscustomobject]@{
-        Name = (($p.DNSName -split '\.')[0]); IP = $ip; Latency = $lat
-        Direct = $isDirect; PeerRelay = $isPeerRelay; Endpoint = $endpoint
-    }
-} -ThrottleLimit 8 # Lower throttle ensures more CPU time per ping
-
-# --- Final Clear and Print ---
-Clear-Host
-Write-Host "Tailscale Network Status (v2.5) - $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
-Write-Host "---------------------------------------------------------------" -ForegroundColor Gray
-
-$results | Sort-Object Name | ForEach-Object {
-    if ($_.PeerRelay) { 
-        $color = "Cyan";  $tag = "-Peer-Relay" 
-    } elseif ($_.Direct) { 
-        $color = "Green"; $tag = "Direct     " 
-    } else { 
-        $color = "Red";   $tag = "Relay      " 
-    }
-
-    $line = "{0,-15} [{1,-12}] - {2} {{{3,5}}} [{4}]" -f $_.Name, $_.IP, $tag, $_.Latency, $_.Endpoint
-    Write-Host $line -ForegroundColor $color
+# --- 2. Identify Online Peers ---
+$onlinePeers = tailscale status | Where-Object { $_ -notmatch "offline" -and $_ -match "100\." } | ForEach-Object {
+    $p = $_ -split '\s+'
+    [pscustomobject]@{ Name = $p[1]; IP = $p[0] }
 }
+
+# --- 3. Setup Shared Memory (The Secret to Real-time) ---
+$SyncHash = [hashtable]::Synchronized(@{})
+foreach ($peer in $onlinePeers) {
+    $SyncHash[$peer.IP] = @{ Latencies = @(); Done = $false; Last = 0; Tag = "Idle"; Path = "-"; Color = "Gray" }
+}
+
+# --- 4. Launch Background Threads ---
+$RunspacePool = [runspacefactory]::CreateRunspacePool(1, 100)
+$RunspacePool.Open()
+$Jobs = foreach ($peer in $onlinePeers) {
+    $PowerShell = [powershell]::Create().AddScript({
+        param($IP, $Sync, $Map)
+        for ($i=1; $i -le 10; $i++) {
+            # Perform Ping
+            $p = ping -n 1 -w 400 $IP
+            $match = [regex]::Match($p, "time[=<](\d+)ms")
+            
+            # Update Shared Memory
+            $data = $Sync[$IP]
+            if ($match.Success) { 
+                $val = [int]$match.Groups[1].Value
+                $data.Latencies += $val
+                $data.Last = $val
+            } else { 
+                $data.Last = -1 # Timeout
+            }
+
+            # Update Path Status every few pings
+            $ts = tailscale status | Select-String $IP | Out-String
+            if ($ts -match 'peer-relay\s+([0-9.]+:[0-9]+)') {
+                $data.Tag = "Peer-Relay"; $data.Color = "Cyan"; $data.Path = $Matches[1]
+            } elseif ($ts -match 'direct\s+([0-9.]+:\d+)') {
+                $data.Tag = "Direct     "; $data.Color = "Green"; $data.Path = $Matches[1]
+            } elseif ($ts -match 'relay\s+"([^"]+)"') {
+                $data.Tag = "Relay      "; $data.Color = "Red"
+                $code = $Matches[1]; $data.Path = if ($Map.ContainsKey($code)) { $Map[$code] } else { "DERP $code" }
+            }
+
+            $Sync[$IP] = $data
+            Start-Sleep -Milliseconds 800 # Delay so you can see it count
+        }
+        $final = $Sync[$IP]; $final.Done = $true; $Sync[$IP] = $final
+    }).AddArgument($peer.IP).AddArgument($SyncHash).AddArgument($DerpLookup)
+    $PowerShell.RunspacePool = $RunspacePool
+    @{ PS = $PowerShell; Handle = $PowerShell.BeginInvoke() }
+}
+
+# --- 5. Main UI Loop (Reads from Shared Memory) ---
+Clear-Host
+Write-Host "Tailscale Parallel Monitor (v4.4)" -ForegroundColor White
 Write-Host "---------------------------------------------------------------" -ForegroundColor Gray
+$HeaderPos = [Console]::CursorTop
+Write-Host "Scanning...                   " -ForegroundColor Yellow
+
+$allDone = $false
+while (-not $allDone) {
+    $allDone = $true
+    foreach ($peer in $onlinePeers) {
+        $data = $SyncHash[$peer.IP]
+        if (-not $data.Done) { $allDone = $false }
+
+        $count = $data.Latencies.Count
+        $lastVal = if ($data.Last -eq -1) { "Timeout" } else { "$($data.Last) ms" }
+
+        # Formatting logic
+        $latDisplay = ""
+        if ($data.Done) {
+            $valid = $data.Latencies | Where-Object { $_ -ne -1 }
+            if ($valid) { 
+                $avg = ($valid | Measure-Object -Average).Average
+                $latDisplay = "{0:N0} ms" -f $avg
+            } else { $latDisplay = "Timeout" }
+        } else {
+            $latDisplay = "[$($count + 1)/10] $lastVal"
+        }
+
+        # Write to screen
+        $idx = [array]::IndexOf($onlinePeers, $peer)
+        [Console]::SetCursorPosition(0, $idx + 3)
+        $line = "{0,-15} [{1,-12}] - {2} {{{3,11}}} [{4}]" -f $peer.Name, $peer.IP, $data.Tag, $latDisplay, $data.Path
+        Write-Host ($line.PadRight([Console]::WindowWidth - 1)) -ForegroundColor $data.Color
+    }
+    Start-Sleep -Milliseconds 150
+}
+
+# --- 6. Cleanup ---
+[Console]::SetCursorPosition(0, 2)
+Write-Host "Done!                         " -ForegroundColor Green
+[Console]::SetCursorPosition(0, $onlinePeers.Count + 3)
+Write-Host "---------------------------------------------------------------" -ForegroundColor Gray
+$RunspacePool.Close()
