@@ -9,10 +9,14 @@ Tailscale Status Scanner
 ---------------------------------------------------------------
 
 Name1      [x.x.x.x] - Direct           {    0 ms}   [      Local Machine      ]
+
 Name2      [x.x.x.x] - Peer-Direct      {   32 ms}   [      x.x.x.x:xxxxx      ]    [   100%] [10/10]
+
 Name3      [x.x.x.x] - Direct           {    1 ms}   [      x.x.x.x:xxxxx      ]    [   100%] [10/10]
+
 Name4      [x.x.x.x] - Relay            {   60 ms}   [      x.x.x.x:xxxxx      ]    [   100%] [10/10]
- 
+
+
 ---------------------------------------------------------------
 
 <br><br>
