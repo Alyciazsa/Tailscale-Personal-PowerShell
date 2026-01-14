@@ -80,9 +80,9 @@ $Jobs = foreach ($peer in $onlinePeers) {
 
 # --- 5. Main UI Loop ---
 Clear-Host
-Write-Host "Tailscale Parallel Monitor (v5.9)" -ForegroundColor White
+Write-Host "Tailscale Status Scanner" -ForegroundColor White
 Write-Host "---------------------------------------------------------------" -ForegroundColor Gray
-$ScanLine = "Scanning... (Local Machine is Simplified)"
+$ScanLine = "Scanning..."
 Write-Host $ScanLine -ForegroundColor Yellow
 
 while ($true) {
